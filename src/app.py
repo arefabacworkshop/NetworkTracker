@@ -65,8 +65,18 @@ class NetworkMonitorApp:
         self.stop_btn = ttk.Button(input_frame, text="Stop", command=self.stop_monitoring, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT, padx=5)
 
-        self.clear_btn = ttk.Button(input_frame, text="Clear Logs", command=self.clear_logs)
-        self.clear_btn.pack(side=tk.RIGHT, padx=5)
+        # Right side buttons frame
+        right_btn_frame = ttk.Frame(input_frame)
+        right_btn_frame.pack(side=tk.RIGHT)
+        
+        self.clear_btn = ttk.Button(right_btn_frame, text="Clear Logs", command=self.clear_logs)
+        self.clear_btn.pack(side=tk.RIGHT, padx=2)
+        
+        self.copy_ips_btn = ttk.Button(right_btn_frame, text="Copy IPs", command=self.copy_all_ips)
+        self.copy_ips_btn.pack(side=tk.RIGHT, padx=2)
+        
+        self.copy_hosts_btn = ttk.Button(right_btn_frame, text="Copy Hostnames", command=self.copy_all_hostnames)
+        self.copy_hosts_btn.pack(side=tk.RIGHT, padx=2)
 
         # --- Status Bar ---
         self.status_var = tk.StringVar()
@@ -102,6 +112,107 @@ class NetworkMonitorApp:
         
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # Create right-click context menu
+        self.context_menu = tk.Menu(self.root, tearoff=0)
+        self.context_menu.add_command(label="Copy Hostname", command=self.copy_selected_hostname)
+        self.context_menu.add_command(label="Copy Remote IP", command=self.copy_selected_ip)
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label="Copy Row", command=self.copy_selected_row)
+        
+        # Bind right-click to treeview
+        self.tree.bind("<Button-3>", self.show_context_menu)
+    
+    def show_context_menu(self, event):
+        """Show context menu on right-click"""
+        # Select the item under cursor
+        item = self.tree.identify_row(event.y)
+        if item:
+            self.tree.selection_set(item)
+            self.context_menu.post(event.x_root, event.y_root)
+    
+    def copy_selected_hostname(self):
+        """Copy the hostname of the selected row to clipboard"""
+        selected = self.tree.selection()
+        if selected:
+            values = self.tree.item(selected[0], 'values')
+            if values and len(values) >= 3:
+                hostname = values[2]  # hostname is 3rd column
+                self.root.clipboard_clear()
+                self.root.clipboard_append(hostname)
+                self.status_var.set(f"Copied hostname: {hostname}")
+    
+    def copy_selected_ip(self):
+        """Copy the remote IP of the selected row to clipboard"""
+        selected = self.tree.selection()
+        if selected:
+            values = self.tree.item(selected[0], 'values')
+            if values and len(values) >= 4:
+                ip = values[3]  # remote_ip is 4th column
+                self.root.clipboard_clear()
+                self.root.clipboard_append(ip)
+                self.status_var.set(f"Copied IP: {ip}")
+    
+    def copy_selected_row(self):
+        """Copy the entire selected row to clipboard"""
+        selected = self.tree.selection()
+        if selected:
+            values = self.tree.item(selected[0], 'values')
+            if values:
+                row_text = "\t".join(str(v) for v in values)
+                self.root.clipboard_clear()
+                self.root.clipboard_append(row_text)
+                self.status_var.set("Copied row to clipboard")
+    
+    def copy_all_hostnames(self):
+        """Copy all hostnames from the table to clipboard"""
+        hostnames = []
+        for item in self.tree.get_children():
+            values = self.tree.item(item, 'values')
+            if values and len(values) >= 3:
+                hostname = values[2]
+                if hostname and hostname != "N/A":
+                    hostnames.append(hostname)
+        
+        if hostnames:
+            # Remove duplicates while preserving order
+            seen = set()
+            unique_hostnames = []
+            for h in hostnames:
+                if h not in seen:
+                    seen.add(h)
+                    unique_hostnames.append(h)
+            
+            self.root.clipboard_clear()
+            self.root.clipboard_append("\n".join(unique_hostnames))
+            self.status_var.set(f"Copied {len(unique_hostnames)} hostnames to clipboard")
+        else:
+            self.status_var.set("No hostnames to copy")
+    
+    def copy_all_ips(self):
+        """Copy all remote IPs from the table to clipboard"""
+        ips = []
+        for item in self.tree.get_children():
+            values = self.tree.item(item, 'values')
+            if values and len(values) >= 4:
+                ip = values[3]
+                if ip:
+                    ips.append(ip)
+        
+        if ips:
+            # Remove duplicates while preserving order
+            seen = set()
+            unique_ips = []
+            for ip in ips:
+                if ip not in seen:
+                    seen.add(ip)
+                    unique_ips.append(ip)
+            
+            self.root.clipboard_clear()
+            self.root.clipboard_append("\n".join(unique_ips))
+            self.status_var.set(f"Copied {len(unique_ips)} IPs to clipboard")
+        else:
+            self.status_var.set("No IPs to copy")
 
     def resolve_hostname(self, ip):
         """Resolve hostname using multiple DNS sources before giving up."""
