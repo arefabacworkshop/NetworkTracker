@@ -306,8 +306,10 @@ class NetworkMonitorApp:
             return
 
         pids = self.find_pids(target)
-        if not pids:
-            messagebox.showerror("Error", f"No active processes found for: {target}")
+        
+        # If target is a PID and not found, show error
+        if not pids and target.isdigit():
+            messagebox.showerror("Error", f"No active processes found for PID: {target}")
             return
 
         # Store target name for potential PID refresh
@@ -322,7 +324,10 @@ class NetworkMonitorApp:
         self.stop_btn.config(state=tk.NORMAL)
         self.target_entry.config(state=tk.DISABLED)
         
-        self.status_var.set(f"Monitoring {len(pids)} process(es) for '{target}'...")
+        if pids:
+            self.status_var.set(f"Monitoring {len(pids)} process(es) for '{target}'...")
+        else:
+            self.status_var.set(f"Waiting for process '{target}' to start...")
         
         # Start the monitoring thread
         self.monitor_thread = threading.Thread(target=self.monitor_loop, args=(pids,), daemon=True)
@@ -344,15 +349,40 @@ class NetworkMonitorApp:
         denied_pids = set()
         refresh_counter = 0
         
-        while self.is_running and active_pids:
-            # Refresh PIDs periodically if monitoring by process name (every 10 iterations)
-            refresh_counter += 1
-            if refresh_counter >= 10 and self.target_name and not self.target_name.isdigit():
+        while self.is_running:
+            # Refresh PIDs logic
+            should_refresh = False
+            
+            # If we are targeting a name (not a PID)
+            if self.target_name and not self.target_name.isdigit():
+                # If no active PIDs, we should look for them immediately
+                if not active_pids:
+                    should_refresh = True
+                else:
+                    # If we have PIDs, check periodically for new instances
+                    refresh_counter += 1
+                    if refresh_counter >= 10:
+                        should_refresh = True
+                        refresh_counter = 0
+            
+            if should_refresh:
                 new_pids = self.find_pids(self.target_name)
+                found_new = False
                 for pid in new_pids:
                     if pid not in active_pids and pid not in denied_pids:
                         active_pids.add(pid)
-                refresh_counter = 0
+                        found_new = True
+                
+                if found_new:
+                    count = len(active_pids)
+                    self.root.after(0, lambda c=count: self.status_var.set(f"Monitoring {c} process(es) for '{self.target_name}'..."))
+                elif not active_pids:
+                    self.root.after(0, lambda: self.status_var.set(f"Waiting for process '{self.target_name}' to start..."))
+
+            # If no active PIDs, sleep briefly and continue
+            if not active_pids:
+                time.sleep(0.5)
+                continue
             
             # Work on a copy to allow modification of the set during iteration
             current_pids = list(active_pids)
@@ -415,14 +445,10 @@ class NetworkMonitorApp:
                             self.root.after(0, self.add_log, timestamp, pid, display_hostname, remote_ip, conn.status)
             
             # Sleep to prevent high CPU usage
-            time.sleep(1.5)
+            time.sleep(1.0)
         
-        # When loop finishes (either stopped or all processes died)
-        if self.is_running:
-            # If we are still "running" but loop exited, it means all processes died
-            self.root.after(0, self.monitoring_finished_all_died)
-        else:
-            self.root.after(0, self.monitoring_finished_user_stop)
+        # When loop finishes (user stopped)
+        self.root.after(0, self.monitoring_finished_user_stop)
 
     def add_log(self, timestamp, pid, hostname, remote_ip, status):
         # Insert at the top (index 0)
