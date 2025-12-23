@@ -8,7 +8,9 @@ import psutil
 import socket
 import threading
 import time
+import queue
 from datetime import datetime
+import webbrowser
 
 try:
     import dns.resolver
@@ -28,8 +30,9 @@ class NetworkMonitorApp:
         # Variables
         self.is_running = False
         self.monitor_thread = None
-        self.printed_hostnames = set()
-        self.printed_ips = set()
+        self.resolver_thread = None
+        self.resolution_queue = queue.Queue()
+        self.active_connections = set()  # Stores (pid, local_addr, remote_addr) tuples
         self.dns_cache = {}
         self.target_name = ""  # Store target for refreshing PIDs
         
@@ -43,9 +46,11 @@ class NetworkMonitorApp:
         """Handle window close - stop monitoring thread first"""
         if self.is_running:
             self.is_running = False
-            # Give thread a moment to stop gracefully
+            # Give threads a moment to stop gracefully
             if self.monitor_thread and self.monitor_thread.is_alive():
                 self.monitor_thread.join(timeout=0.5)
+            if self.resolver_thread and self.resolver_thread.is_alive():
+                self.resolver_thread.join(timeout=0.5)
         self.root.destroy()
 
     def create_widgets(self):
@@ -68,6 +73,9 @@ class NetworkMonitorApp:
         # Right side buttons frame
         right_btn_frame = ttk.Frame(input_frame)
         right_btn_frame.pack(side=tk.RIGHT)
+        
+        self.about_btn = ttk.Button(right_btn_frame, text="About", command=self.show_about)
+        self.about_btn.pack(side=tk.RIGHT, padx=2)
         
         self.clear_btn = ttk.Button(right_btn_frame, text="Clear Logs", command=self.clear_logs)
         self.clear_btn.pack(side=tk.RIGHT, padx=2)
@@ -249,15 +257,19 @@ class NetworkMonitorApp:
             return None
     
     def _resolve_via_dns_servers(self, ip):
-        """Try resolving hostname using multiple public DNS servers."""
-        # List of reliable public DNS servers
+        """Try resolving hostname using a prioritized list of public DNS servers."""
+        # Expanded list of reliable public DNS servers in priority order
         dns_servers = [
             '8.8.8.8',        # Google Primary
-            '8.8.4.4',        # Google Secondary
             '1.1.1.1',        # Cloudflare Primary
-            '1.0.0.1',        # Cloudflare Secondary
-            '9.9.9.9',        # Quad9 Primary
             '208.67.222.222', # OpenDNS Primary
+            '9.9.9.9',        # Quad9 Primary
+            '4.2.2.1',        # Level3
+            '8.8.4.4',        # Google Secondary
+            '1.0.0.1',        # Cloudflare Secondary
+            '64.6.64.6',      # Verisign
+            '77.88.8.8',      # Yandex
+            '8.26.56.26',     # Comodo
         ]
         
         try:
@@ -315,9 +327,8 @@ class NetworkMonitorApp:
         # Store target name for potential PID refresh
         self.target_name = target
 
-        # Clear deduplication sets for the new session so existing connections are shown again
-        self.printed_hostnames.clear()
-        self.printed_ips.clear()
+        # Clear deduplication sets for the new session
+        self.active_connections.clear()
 
         self.is_running = True
         self.start_btn.config(state=tk.DISABLED)
@@ -332,6 +343,10 @@ class NetworkMonitorApp:
         # Start the monitoring thread
         self.monitor_thread = threading.Thread(target=self.monitor_loop, args=(pids,), daemon=True)
         self.monitor_thread.start()
+        
+        # Start the resolver thread
+        self.resolver_thread = threading.Thread(target=self.resolver_loop, daemon=True)
+        self.resolver_thread.start()
 
     def stop_monitoring(self):
         self.is_running = False
@@ -341,8 +356,37 @@ class NetworkMonitorApp:
     def clear_logs(self):
         for item in self.tree.get_children():
             self.tree.delete(item)
-        self.printed_hostnames.clear()
-        self.printed_ips.clear()
+        self.active_connections.clear()
+
+    def show_about(self):
+        """Show about dialog with link to GitHub repository"""
+        messagebox.showinfo(
+            "About NetworkTracker",
+            "Network Connection Monitor\n\n"
+            "Visit the GitHub repository for more information:\n"
+            "https://github.com/arefabacworkshop/NetworkTracker\n\n"
+            "Click OK to open the repository in your browser."
+        )
+        webbrowser.open("https://github.com/arefabacworkshop/NetworkTracker")
+
+    def resolver_loop(self):
+        """Background thread to resolve hostnames without blocking the monitor loop"""
+        while self.is_running:
+            try:
+                # Get item from queue with timeout to allow checking is_running
+                timestamp, pid, remote_ip, status = self.resolution_queue.get(timeout=0.5)
+                
+                hostname = self.resolve_hostname(remote_ip)
+                display_hostname = hostname if hostname else "N/A"
+                
+                # Update UI in main thread
+                self.root.after(0, self.add_log, timestamp, pid, display_hostname, remote_ip, status)
+                
+                self.resolution_queue.task_done()
+            except queue.Empty:
+                continue
+            except Exception:
+                continue
 
     def monitor_loop(self, initial_pids):
         active_pids = set(initial_pids)
@@ -361,7 +405,8 @@ class NetworkMonitorApp:
                 else:
                     # If we have PIDs, check periodically for new instances
                     refresh_counter += 1
-                    if refresh_counter >= 10:
+                    # Check every ~5 seconds (50 * 0.1s)
+                    if refresh_counter >= 50:
                         should_refresh = True
                         refresh_counter = 0
             
@@ -386,6 +431,9 @@ class NetworkMonitorApp:
             
             # Work on a copy to allow modification of the set during iteration
             current_pids = list(active_pids)
+            
+            # Track connections found in THIS scan
+            current_scan_connections = set()
             
             for pid in current_pids:
                 if not self.is_running: 
@@ -415,6 +463,7 @@ class NetworkMonitorApp:
                         break
                     if conn.raddr:
                         remote_ip = conn.raddr.ip
+                        remote_port = conn.raddr.port
                         
                         # Filter out local loopbacks, empty addresses, and IPv6 mapped addresses
                         if remote_ip in ["0.0.0.0", "::", "127.0.0.1", "::1"]:
@@ -423,29 +472,25 @@ class NetworkMonitorApp:
                         if remote_ip.startswith("::ffff:"):
                             remote_ip = remote_ip[7:]  # Strip the prefix
                         
-                        hostname = self.resolve_hostname(remote_ip)
+                        # Unique identifier for this connection target
+                        # (PID, RemoteIP, RemotePort) - Ignoring local port to group simultaneous connections
+                        # This prevents "repeated records" when a process opens multiple sockets to the same server
+                        conn_key = (pid, remote_ip, remote_port)
+                        current_scan_connections.add(conn_key)
                         
-                        # Logic to determine if we should print this connection
-                        should_print = False
-                        
-                        if hostname:
-                            if hostname not in self.printed_hostnames:
-                                should_print = True
-                                self.printed_hostnames.add(hostname)
-                        else:
-                            # If no hostname, check if we've seen this IP
-                            if remote_ip not in self.printed_ips:
-                                should_print = True
-                                self.printed_ips.add(remote_ip)
-                        
-                        if should_print:
+                        # If this is a NEW connection we haven't seen in the active set
+                        if conn_key not in self.active_connections:
+                            self.active_connections.add(conn_key)
                             timestamp = datetime.now().strftime("%H:%M:%S")
-                            display_hostname = hostname if hostname else "N/A"
-                            # Update UI in main thread
-                            self.root.after(0, self.add_log, timestamp, pid, display_hostname, remote_ip, conn.status)
+                            # Queue for resolution and display
+                            self.resolution_queue.put((timestamp, pid, remote_ip, conn.status))
             
-            # Sleep to prevent high CPU usage
-            time.sleep(1.0)
+            # Remove connections that are no longer active from our tracking set
+            # This allows them to be logged again if they reappear (new connection on same ports)
+            self.active_connections = self.active_connections.intersection(current_scan_connections)
+            
+            # Sleep briefly - much faster polling now (10Hz)
+            time.sleep(0.1)
         
         # When loop finishes (user stopped)
         self.root.after(0, self.monitoring_finished_user_stop)
